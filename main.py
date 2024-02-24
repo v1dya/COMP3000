@@ -13,6 +13,7 @@ import pdb
 from sklearn.svm import SVC
 from sklearn.feature_selection import RFE
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, recall_score, precision_score, confusion_matrix, f1_score
 
 def get_data_from_abide():
   downloads = 'abide/downloads/Outputs/ccs/filt_global/rois_aal/'
@@ -20,7 +21,7 @@ def get_data_from_abide():
 
   pheno_file = open(pheno_file, 'r')
   pheno_list = pheno_file.readlines()
-  
+
   labels_dict = {}
   for i in pheno_list[1:]:
     file_name = i.split(',')[6]
@@ -66,7 +67,6 @@ def get_top_features_from_SVM_RFE(X, Y, N):
   svm = SVC(kernel="linear")
 
   rfe = RFE(estimator=svm, n_features_to_select=N, step=1, verbose=1)
-
 
   rfe.fit(X, Y)
 
@@ -172,13 +172,10 @@ def encode_data(dataloader, sae1, sae2, device):
 
 
 if __name__ == "__main__":
-  print("Hi this is main")
-  
   use_cuda = torch.cuda.is_available()
   print("Torch Cuda is Available =",use_cuda)
 
   device = torch.device("cuda:0" if use_cuda else "cpu")
-  torch.backends.cudnn.benchmark = True
 
   # seed = int(np.random.rand() * (2**32 - 1))
   seed = 2071878563
@@ -253,7 +250,7 @@ if __name__ == "__main__":
     classifier_criterion = nn.CrossEntropyLoss()
 
     fine_tuning_epochs = 100
-    
+
     loss_sae1 =[]
     #Train SAE 1
     for epoch in range(SAE1_epochs):
@@ -410,6 +407,8 @@ if __name__ == "__main__":
   total = 0
   correct = 0
 
+  true_labels = np.array([])
+  predicted_labels = np.array([])
 
   for i in range(len(encoded_test_data)):
     data = encoded_test_data[i].float().to(device) 
@@ -418,8 +417,31 @@ if __name__ == "__main__":
     outputs = classifier(data)
 
     _, predicted = torch.max(outputs.data, 1)
-    total += labels.size(0)
-    correct += (predicted == labels).sum().item()
 
-  accuracy = 100 * correct / total
-  print(f'Accuracy of the model on the test dataset: {accuracy:.2f}%')
+    true_labels = np.concatenate((true_labels,labels.cpu().numpy()),axis=0)
+    predicted_labels = np.concatenate((predicted_labels,predicted.cpu().numpy()),axis=0)
+
+  TP,FP,TN,FN = 0,0,0,0
+
+  for true_label, predicted_label in zip(true_labels, predicted_labels):
+    if true_label == predicted_label == 0:
+        TP += 1  # True Positive
+    elif true_label == predicted_label == 1:
+        TN += 1  # True Negative
+    elif true_label == 1 and predicted_label == 0:
+        FP += 1  # False Positive
+    elif true_label == 0 and predicted_label == 1:
+        FN += 1  # False Negative
+
+  accuracy = (TP + TN) / (TP + TN + FP + FN)
+  sensitivity = TP / (TP + FN) 
+  recall = TN / (TN + FP) 
+  precision = TP / (TP + FP)
+  f1 = (2 * precision * sensitivity) / (precision + sensitivity)
+  cm = np.array([[TP,FP],[FN,TN]])
+
+  print(f'Accuracy: {(accuracy * 100):.2f}%')
+  print(f'Recall: {recall:.2f}')
+  print(f'Precision: {precision:.2f}')
+  print(f'F1_Score: {f1:.2f}')
+  print(f'Confusion Matrix:\n{cm}')
