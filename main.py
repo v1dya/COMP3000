@@ -85,16 +85,38 @@ def fishers_z_transform(x):
   
 
 class SparseAutoencoder(nn.Module):
-  def __init__(self, input_size, encoded_output_size):
+  def __init__(self, input_size, encoded_output_size, rho=0.2, beta=2, criterion=nn.MSELoss()):
+    """
+    rho: desired sparsity parameter
+    beta: weight of the KL divergence term
+    """
     super(SparseAutoencoder, self).__init__()
 
     self.encoder = nn.Linear(input_size, encoded_output_size)
     self.decoder = nn.Linear(encoded_output_size, input_size)
+    self.rho = rho
+    self.beta = beta
+    self.criterion = criterion
+  
+  def kl_divergence(self, rho, rho_hat):
+    """Calculates KL divergence for regularization."""
+    return rho * torch.log(rho / rho_hat) + (1 - rho) * torch.log((1 - rho) / (1 - rho_hat)) 
   
   def forward(self, x):
     encoded = torch.relu(self.encoder(x))
+
+    # Compute average activation of hidden neurons
+    rho_hat = torch.mean(encoded, dim=0) 
+
+    kl_loss = self.kl_divergence(self.rho, rho_hat).sum()
+
     decoded = self.decoder(encoded)
-    return encoded, decoded
+
+    # Total loss: Reconstruction loss + KL divergence
+    mse_loss = self.criterion(decoded, x)
+    loss = mse_loss + self.beta * kl_loss 
+
+    return encoded, decoded, loss
   
 class SoftmaxClassifier(nn.Module):
   def __init__(self, input_size, num_classes):
@@ -104,6 +126,19 @@ class SoftmaxClassifier(nn.Module):
   def forward(self, x):
     out = self.linear(x)
     return out
+  
+class StackedSparseAutoencoder(nn.Module):
+  def __init__(self, SAE1, SAE2, classifier):
+      super(StackedSparseAutoencoder, self).__init__()
+      self.sae1 = SAE1  # Assuming you have your pre-trained SAE1
+      self.sae2 = SAE2  # Assuming you have your pre-trained SAE2
+      self.classifier = classifier 
+
+  def forward(self, x):
+      x = self.sae1.encoder(x)  # Pass through the encoder of SAE1
+      x = self.sae2.encoder(x)  # Pass through the encoder of SAE2
+      x = self.classifier(x)
+      return x
   
 class CustomDataset(Dataset):
   def __init__(self, data, labels):
@@ -127,8 +162,8 @@ def encode_data(dataloader, sae1, sae2, device):
     data = data.float().to(device)
 
     with torch.no_grad():
-      encoded_features, _ = sae1(data)
-      encoded_features, _ = sae2(encoded_features)
+      encoded_features, _, __ = sae1(data)
+      encoded_features, _, __ = sae2(encoded_features)
       encoded_data.append(encoded_features)
       labels.append(label)
 
@@ -148,6 +183,8 @@ if __name__ == "__main__":
   # seed = int(np.random.rand() * (2**32 - 1))
   seed = 2071878563
 
+  # 2071878563 98.31% accuracy with sparsity and fine tuning
+
   torch.manual_seed(seed)
   np.random.seed(seed)
   random.seed(seed)
@@ -166,7 +203,7 @@ if __name__ == "__main__":
   #top_features = get_top_features_from_SVM_RFE(feature_vecs, labels, 1000)
   #np.savetxt("top_features_116_step20.csv", top_features, delimiter=",")
   
-  top_features = np.loadtxt('top_features_116_step20.csv', delimiter=',')
+  top_features = np.loadtxt('top_features_dparsf_aal_116_step20.csv', delimiter=',')
   
   train_idx, test_idx = train_test_split(list(range(len(top_features))), test_size=0.2)
 
@@ -196,9 +233,10 @@ if __name__ == "__main__":
   train_dataloader = DataLoader(train_set, **params)
   test_dataloader = DataLoader(test_set, **test_params)
 
-  SAE1 = SparseAutoencoder(1000, 500).to(device)
-  SAE2 = SparseAutoencoder(500, 200).to(device)
-  classifier = SoftmaxClassifier(200, 2).to(device) 
+  SAE1 = SparseAutoencoder(1000, 200).to(device)
+  SAE2 = SparseAutoencoder(200, 100).to(device)
+  classifier = SoftmaxClassifier(100, 2).to(device)
+  model = StackedSparseAutoencoder(SAE1, SAE2, classifier).to(device)
 
   train_model = False
   if (train_model):
@@ -208,12 +246,13 @@ if __name__ == "__main__":
     SAE2_epochs = 200
     optimizer_sae2 = optim.Adam( SAE2.parameters(), lr=0.001, weight_decay=1e-4 )
 
-    classifier_epochs = 1000
+    classifier_epochs = 100
     optimizer_classifier = optim.Adam( classifier.parameters(), lr=0.001, weight_decay=1e-4 )
 
     sae_criterion = nn.MSELoss()
     classifier_criterion = nn.CrossEntropyLoss()
 
+    fine_tuning_epochs = 100
     
     loss_sae1 =[]
     #Train SAE 1
@@ -224,9 +263,8 @@ if __name__ == "__main__":
 
         optimizer_sae1.zero_grad()
 
-        encoded_features, decoded_featues = SAE1(data)
+        encoded_features, decoded_featues, loss = SAE1(data)
 
-        loss = sae_criterion(decoded_featues, data)
         loss.backward()
         optimizer_sae1.step()
       loss_sae1.append(loss.item())
@@ -242,7 +280,7 @@ if __name__ == "__main__":
       data = data.float().to(device) 
 
       with torch.no_grad():
-        encoded_features, _ = SAE1(data)
+        encoded_features, _, __ = SAE1(data)
         encoded_features_from_sae1.append(encoded_features)
         labels_from_sae1.append(labels)
 
@@ -262,9 +300,8 @@ if __name__ == "__main__":
 
         optimizer_sae2.zero_grad()
 
-        encoded_features, decoded_featues = SAE2(data)
+        encoded_features, decoded_featues, loss = SAE2(data)
 
-        loss = sae_criterion(decoded_featues, data)
         loss.backward()
         optimizer_sae2.step()
       loss_sae2.append(loss.item())
@@ -279,7 +316,7 @@ if __name__ == "__main__":
       data = data.float().to(device) 
 
       with torch.no_grad():
-        encoded_features, _ = SAE2(data)
+        encoded_features, _, __ = SAE2(data)
         encoded_features_from_sae2.append(encoded_features)
         labels_from_sae2.append(labels)
 
@@ -310,7 +347,26 @@ if __name__ == "__main__":
 
     print("======================================\nTrained classifier\n======================================")
 
-    dig, axs = plt.subplots(1, 3, figsize=(15,5))
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+    loss_model = []
+    for epoch in range(fine_tuning_epochs):
+      for batch in train_dataloader:
+        data, labels = batch
+        data = data.float().to(device)
+        labels = labels.long().to(device) 
+
+        optimizer.zero_grad()
+        outputs = model(data)
+        loss = classifier_criterion(outputs, labels) 
+        loss.backward()
+        optimizer.step()
+      loss_model.append(loss.item())
+      print(f"Model: Epoch {epoch} loss: {loss.item()}")
+
+    print("======================================\nFine tuned model\n======================================")
+
+    dig, axs = plt.subplots(1, 4, figsize=(15,5))
     
     axs[0].plot(range(SAE1_epochs), loss_sae1)
     axs[0].set_title('SAE1 Loss')
@@ -328,6 +384,10 @@ if __name__ == "__main__":
     axs[2].set_title('Classifier Loss')
     axs[2].set_xlabel('Epoch')
     # axs[2].set_ylabel('Loss')  # Optional, as it shares the y-axis with the first plot
+
+    axs[3].plot(range(fine_tuning_epochs), loss_model)
+    axs[3].set_title('Model Loss')
+    axs[3].set_xlabel('Epoch')
 
     plt.tight_layout()  # Adjust the padding between and around subplots
     plt.show()
