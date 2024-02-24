@@ -203,7 +203,7 @@ if __name__ == "__main__":
   #top_features = get_top_features_from_SVM_RFE(feature_vecs, labels, 1000)
   #np.savetxt("top_features_116_step20.csv", top_features, delimiter=",")
   
-  top_features = np.loadtxt('top_features_dparsf_aal_116_step20.csv', delimiter=',')
+  top_features = np.loadtxt('top_features_ccs_aal_116_step20.csv', delimiter=',')
   
   train_idx, test_idx = train_test_split(list(range(len(top_features))), test_size=0.2)
 
@@ -233,17 +233,17 @@ if __name__ == "__main__":
   train_dataloader = DataLoader(train_set, **params)
   test_dataloader = DataLoader(test_set, **test_params)
 
-  SAE1 = SparseAutoencoder(1000, 200).to(device)
-  SAE2 = SparseAutoencoder(200, 100).to(device)
+  SAE1 = SparseAutoencoder(1000, 500).to(device)
+  SAE2 = SparseAutoencoder(500, 100).to(device)
   classifier = SoftmaxClassifier(100, 2).to(device)
   model = StackedSparseAutoencoder(SAE1, SAE2, classifier).to(device)
 
   train_model = False
   if (train_model):
-    SAE1_epochs = 200
+    SAE1_epochs = 100
     optimizer_sae1 = optim.Adam( SAE1.parameters(), lr=0.001, weight_decay=1e-4 )
     
-    SAE2_epochs = 200
+    SAE2_epochs = 100
     optimizer_sae2 = optim.Adam( SAE2.parameters(), lr=0.001, weight_decay=1e-4 )
 
     classifier_epochs = 100
