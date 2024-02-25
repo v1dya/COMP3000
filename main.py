@@ -12,8 +12,7 @@ import os
 import pdb
 from sklearn.svm import SVC
 from sklearn.feature_selection import RFE
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, recall_score, precision_score, confusion_matrix, f1_score
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 def get_data_from_abide():
   downloads = 'abide/downloads/Outputs/ccs/filt_global/rois_aal/'
@@ -147,10 +146,12 @@ class CustomDataset(Dataset):
     self.data = data
 
   def __len__(self):
-    return len(self.data)
+    return len(self.data.indices)
   
   def __getitem__(self, idx):
-    return self.data[idx], self.labels[idx]
+    data_idx = self.data.indices[idx]  # Get index into the original dataset
+    labels_idx = self.labels.indices[idx]  # Get index into the original dataset
+    return self.data.dataset[data_idx], self.labels.dataset[labels_idx] 
 
 
 def encode_data(dataloader, sae1, sae2, device):
@@ -168,6 +169,40 @@ def encode_data(dataloader, sae1, sae2, device):
       labels.append(label)
 
   return encoded_data, labels
+
+def get_encoded_data(model, dataloader, dataloader_params, device):
+  """Encodes data from a dataloader using a given model.
+  
+  Args:
+      model: The PyTorch model used for encoding.
+      dataloader: The PyTorch dataloader containing the data.
+      device: The device (e.g., 'cuda:0' or 'cpu') where the model and data should be sent.
+
+  Returns:
+      A tuple: (encoded_dataset, encoded_dataset_loader), where
+          * encoded_dataset is a TensorDataset containing the encoded features and labels.
+          * encoded_dataset_loader is a DataLoader for the encoded_dataset.
+  """  
+
+  encoded_features_from_model = []
+  labels_from_model = []
+
+  for batch in dataloader:
+    data, labels = batch
+    data = data.float().to(device) 
+
+    with torch.no_grad():
+      encoded_features, _, __ = model(data)  # Assuming your model outputs encoded features, ...
+      encoded_features_from_model.append(encoded_features)
+      labels_from_model.append(labels)
+
+  encoded_dataset_tensor = torch.cat(encoded_features_from_model, dim=0)
+  labels_tensor = torch.cat(labels_from_model, dim=0)
+
+  encoded_dataset = TensorDataset(encoded_dataset_tensor, labels_tensor)
+  encoded_dataset_loader = DataLoader(encoded_dataset, **dataloader_params)
+
+  return encoded_dataset, encoded_dataset_loader 
   
 
 
@@ -180,8 +215,6 @@ if __name__ == "__main__":
   # seed = int(np.random.rand() * (2**32 - 1))
   seed = 2071878563
 
-  # 2071878563 98.31% accuracy with sparsity and fine tuning
-
   torch.manual_seed(seed)
   np.random.seed(seed)
   random.seed(seed)
@@ -189,10 +222,10 @@ if __name__ == "__main__":
       torch.cuda.manual_seed_all(seed)
 
   data, labels = get_data_from_abide()
-  labels = np.array(labels)
+  labels_from_abide = np.array(labels)
   
   #Convert labels from 1, 2 to 0, 1 for PyTorch compatibility
-  labels = labels - 1
+  labels_from_abide = labels_from_abide - 1
 
 
   #feature_vecs = get_feature_vecs(data)
@@ -202,236 +235,356 @@ if __name__ == "__main__":
   
   top_features = np.loadtxt('top_features_ccs_aal_116_step20.csv', delimiter=',')
   
-  train_idx, test_idx = train_test_split(list(range(len(top_features))), test_size=0.2)
+  skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)  # Example with 5 folds
 
-  dataset = {}
-  label = {}
+  avg_TP, avg_FP, avg_FN, avg_TN = [], [], [], []
 
-  dataset['train'] = Subset(top_features, train_idx)
-  label['train'] = Subset(labels, train_idx)
+  fold = 0
+  for train_idx, test_idx in skf.split(top_features, labels_from_abide):
+    fold+=1
+    print(f'======================================\nSplit {fold}\n======================================')
+    dataset = {}
+    label = {}
 
-  dataset['test'] = Subset(top_features, test_idx)
-  label['test'] = Subset(labels, test_idx)
+    # Split the training set into training and validation
+    train_subidx, val_subidx = train_test_split(train_idx, test_size=0.1, random_state=seed)  # Adjust test_size as needed
 
-  train_set = CustomDataset(dataset['train'], label['train'])
-  test_set = CustomDataset(dataset['test'], label['test'])
+    dataset['train'] = Subset(top_features, train_subidx)
+    label['train'] = Subset(labels_from_abide, train_subidx)
 
-  params = {
-    'batch_size': 128,
-    'shuffle': True,
-    'num_workers': 0
-  }
+    dataset['val'] = Subset(top_features, val_subidx)
+    label['val'] = Subset(labels_from_abide, val_subidx)
 
-  test_params = {
-    'batch_size': 128,
-    'num_workers': 0
-  }
+    dataset['test'] = Subset(top_features, test_idx)
+    label['test'] = Subset(labels_from_abide, test_idx)
 
-  train_dataloader = DataLoader(train_set, **params)
-  test_dataloader = DataLoader(test_set, **test_params)
+    print("Total: ", len(top_features))  # Original dataset size
+    print("Train: ", len(dataset['train'].indices)) 
+    print("Test: ", len(dataset['test'].indices)) 
+    print("Validation: ", len(dataset['val'].indices)) 
 
-  SAE1 = SparseAutoencoder(1000, 500).to(device)
-  SAE2 = SparseAutoencoder(500, 100).to(device)
-  classifier = SoftmaxClassifier(100, 2).to(device)
-  model = StackedSparseAutoencoder(SAE1, SAE2, classifier).to(device)
+    train_set = CustomDataset(dataset['train'], label['train'])
+    test_set = CustomDataset(dataset['test'], label['test'])
+    val_set = CustomDataset(dataset['val'],label['val'])
 
-  train_model = False
-  if (train_model):
-    SAE1_epochs = 100
-    optimizer_sae1 = optim.Adam( SAE1.parameters(), lr=0.001, weight_decay=1e-4 )
+    params = {
+      'batch_size': 128,
+      'shuffle': True,
+      'num_workers': 0
+    }
+
+    val_params = {
+      'batch_size': 128,
+      'shuffle': False,
+      'num_workers': 0
+    }
+
+    test_params = {
+      'batch_size': 128,
+      'shuffle': False,
+      'num_workers': 0
+    }
     
-    SAE2_epochs = 100
-    optimizer_sae2 = optim.Adam( SAE2.parameters(), lr=0.001, weight_decay=1e-4 )
+    train_dataloader = DataLoader(train_set, **params)
+    test_dataloader = DataLoader(test_set, **test_params)
+    val_dataloader = DataLoader(val_set, **val_params)
 
-    classifier_epochs = 100
-    optimizer_classifier = optim.Adam( classifier.parameters(), lr=0.001, weight_decay=1e-4 )
+    SAE1 = SparseAutoencoder(1000, 500).to(device)
+    SAE2 = SparseAutoencoder(500, 100).to(device)
+    classifier = SoftmaxClassifier(100, 2).to(device)
+    model = StackedSparseAutoencoder(SAE1, SAE2, classifier).to(device)
 
-    sae_criterion = nn.MSELoss()
-    classifier_criterion = nn.CrossEntropyLoss()
+    verbose = True
+    train_model = True
+    if (train_model):
+      SAE1_epochs = 50
+      optimizer_sae1 = optim.Adam( SAE1.parameters(), lr=0.001, weight_decay=1e-4 )
+      
+      SAE2_epochs = 50
+      optimizer_sae2 = optim.Adam( SAE2.parameters(), lr=0.001, weight_decay=1e-4 )
 
-    fine_tuning_epochs = 100
+      classifier_epochs = 100
+      optimizer_classifier = optim.Adam( classifier.parameters(), lr=0.001, weight_decay=1e-4 )
 
-    loss_sae1 =[]
-    #Train SAE 1
-    for epoch in range(SAE1_epochs):
-      for batch in train_dataloader:
-        data, labels = batch
-        data = data.float().to(device) 
+      sae_criterion = nn.MSELoss()
+      classifier_criterion = nn.CrossEntropyLoss()
 
-        optimizer_sae1.zero_grad()
+      fine_tuning_epochs = 2000
 
-        encoded_features, decoded_featues, loss = SAE1(data)
+      loss_sae1 = []
+      val_sae1 = []
 
-        loss.backward()
-        optimizer_sae1.step()
-      loss_sae1.append(loss.item())
-      print(f"SAE 1: Epoch {epoch}, loss {loss.item()}")
+      for epoch in range(SAE1_epochs):
+        for batch in train_dataloader:
+          data, labels = batch
+          data = data.float().to(device) 
+
+          optimizer_sae1.zero_grad()
+
+          encoded_features, decoded_featues, loss = SAE1(data)
+
+          loss.backward()
+          optimizer_sae1.step()
+        loss_sae1.append(loss.item())
+
+        val_loss = 0.0
+        with torch.no_grad():
+          for batch in val_dataloader:
+            data, labels = batch
+            data = data.float().to(device)
+
+            encoded_features, decoded_featues, loss = SAE1(data)
+            val_loss += loss.item()
+
+        val_loss /= len(val_dataloader)
+        val_sae1.append(val_loss)
+
+        if verbose:
+          print(f"SAE 1: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
+      
+      print("======================================\nTrained SAE 1\n======================================")
+
+      encoded_dataset, encoded_dataset_loader = get_encoded_data(SAE1, train_dataloader, params, device)
+
+      val_encoded_dataset, val_encoded_dataset_loader = get_encoded_data(SAE1, val_dataloader, val_params, device)
+
+      loss_sae2 = []
+      val_sae2 = []
+
+      for epoch in range(SAE2_epochs):
+        for batch in encoded_dataset_loader:
+          data, labels = batch
+          data = data.float().to(device) 
+
+          optimizer_sae2.zero_grad()
+
+          encoded_features, decoded_featues, loss = SAE2(data)
+
+          loss.backward()
+          optimizer_sae2.step()
+        loss_sae2.append(loss.item())
+
+        val_loss = 0.0
+        with torch.no_grad():
+          for batch in val_encoded_dataset_loader:
+            data, labels = batch
+            data = data.float().to(device)
+
+            encoded_features, decoded_featues, loss = SAE2(data)
+            val_loss += loss.item()
+
+        val_loss /= len(val_encoded_dataset_loader)
+        val_sae2.append(val_loss)
+
+        if verbose:
+          print(f"SAE 2: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
+
+      print("======================================\nTrained SAE 2\n======================================")
+
+      encoded_dataset, encoded_dataset_loader = get_encoded_data(SAE2, encoded_dataset_loader, params, device)
+
+      val_encoded_dataset, val_encoded_dataset_loader = get_encoded_data(SAE2, val_encoded_dataset_loader, val_params, device)
+
+      loss_classifier = []
+      val_classifier = []
+
+      for epoch in range(classifier_epochs):
+        for batch in encoded_dataset_loader:
+          data, labels = batch
+          data = data.float().to(device) 
+          labels = labels.long().to(device) 
+
+          optimizer_classifier.zero_grad()
+
+          classifier_output = classifier(data)
+
+          loss = classifier_criterion(classifier_output, labels)
+          loss.backward()
+          optimizer_classifier.step()
+
+        loss_classifier.append(loss.item())
+
+        val_loss = 0.0
+        with torch.no_grad():
+          for batch in val_encoded_dataset_loader:
+            data, labels = batch
+            data = data.float().to(device)
+            labels = labels.long().to(device) 
+
+            classifier_output = classifier(data)
+            loss = classifier_criterion(classifier_output, labels)
+
+            val_loss += loss.item()
+
+        val_loss /= len(val_encoded_dataset_loader)  # Average validation loss
+        val_classifier.append(val_loss)
+
+        if verbose:
+          print(f"Classifier: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
+
+      print("======================================\nTrained classifier\n======================================")
+
+      optimizer = optim.Adam(model.parameters(), lr=0.0001)
+
+      loss_model = []
+      accuracy_model = []
+      val_model = []
+      val_accuracy_model = []
+      for epoch in range(fine_tuning_epochs):
+        total = 0
+        correct = 0
+        for batch in train_dataloader:
+          data, labels = batch
+          data = data.float().to(device)
+          labels = labels.long().to(device) 
+
+          optimizer.zero_grad()
+          outputs = model(data)
+          _, predicted = torch.max(outputs.data, 1)
+          total += labels.size(0)
+          correct += (predicted == labels).sum().item()
+
+          loss = classifier_criterion(outputs, labels) 
+          loss.backward()
+          optimizer.step()
+        loss_model.append(loss.item())
+        accuracy_model.append(100 * correct / total)
+
+        val_loss = 0.0
+        val_total = 0
+        val_correct = 0
+        with torch.no_grad():
+          for batch in val_dataloader:
+            data, labels = batch
+            data = data.float().to(device)
+            labels = labels.long().to(device) 
+
+            outputs = model(data)
+            _, predicted = torch.max(outputs.data, 1)
+
+            loss = classifier_criterion(outputs, labels) 
+
+            val_total += labels.size(0)
+            val_correct += (predicted == labels).sum().item()
+
+            val_loss += loss.item()
+
+        val_accuracy_model.append(100 * val_correct / val_total)
+        val_loss /= len(val_dataloader)
+        val_model.append(val_loss)
+
+        if verbose:
+          print(f"Model: Epoch {epoch}, loss {loss.item()}, validation loss {val_loss}")
+
+      print("======================================\nFine tuned model\n======================================")
+
+      dig, axs = plt.subplots(1, 5, figsize=(15,5))
+      
+      # Plot for SAE1
+      axs[0].plot(range(SAE1_epochs), loss_sae1, label='Training Loss')
+      axs[0].plot(range(SAE1_epochs), val_sae1, label='Validation Loss')
+      axs[0].set_title('SAE1 Loss')
+      axs[0].set_xlabel('Epoch')
+      axs[0].set_ylabel('Loss')
+      axs[0].legend()
+
+      # Plot for SAE2
+      axs[1].plot(range(SAE2_epochs), loss_sae2, label='Training Loss')
+      axs[1].plot(range(SAE2_epochs), val_sae2, label='Validation Loss')
+      axs[1].set_title('SAE2 Loss')
+      axs[1].set_xlabel('Epoch')
+      axs[1].legend()
+
+      # Plot for classifier
+      axs[2].plot(range(classifier_epochs), loss_classifier, label='Training Loss')
+      axs[2].plot(range(classifier_epochs), val_classifier, label='Validation Loss')
+      axs[2].set_title('Classifier Loss')
+      axs[2].set_xlabel('Epoch')
+      axs[2].legend()
+
+      # Plot for Model
+      axs[3].plot(range(fine_tuning_epochs), loss_model, label='Training Loss')
+      axs[3].plot(range(fine_tuning_epochs), val_model, label='Validation Loss')
+      axs[3].set_title('Model Loss')
+      axs[3].set_xlabel('Epoch')
+      axs[3].legend()
+
+      # Plot for Accuracy over fine tuning
+      axs[4].plot(range(fine_tuning_epochs), accuracy_model, label='Training Accuracy')
+      axs[4].plot(range(fine_tuning_epochs), val_accuracy_model, label='Validation Accuracy')
+      axs[4].set_title('Accuracy')
+      axs[4].set_xlabel('Epoch')
+      axs[4].legend()
+
+      plt.tight_layout()
+      
+      if verbose:
+        plt.show()
+
+      # pdb.set_trace()
+
+      # torch.save(SAE1.state_dict(), 'SAE1.pth')
+      # torch.save(SAE2.state_dict(), 'SAE2.pth')
+      # torch.save(classifier.state_dict(), 'classifier.pth')
+    else:
+      SAE1.load_state_dict(torch.load('SAE1.pth'))
+      SAE2.load_state_dict(torch.load('SAE2.pth'))
+      classifier.load_state_dict(torch.load('classifier.pth'))
+
+    print("Infer data from trained SAE")
+    encoded_test_data, test_labels = encode_data(test_dataloader, SAE1, SAE2, device)
+
+    classifier.eval()
+
+    true_labels = np.array([])
+    predicted_labels = np.array([])
+
+    for i in range(len(encoded_test_data)):
+      data = encoded_test_data[i].float().to(device) 
+      labels = test_labels[i].long().to(device) 
+
+      outputs = classifier(data)
+
+      _, predicted = torch.max(outputs.data, 1)
+
+      true_labels = np.concatenate((true_labels,labels.cpu().numpy()),axis=0)
+      predicted_labels = np.concatenate((predicted_labels,predicted.cpu().numpy()),axis=0)
+
+    TP,FP,TN,FN = 0,0,0,0
+
+    for true_label, predicted_label in zip(true_labels, predicted_labels):
+      if true_label == predicted_label == 0:
+          TP += 1  # True Positive
+      elif true_label == predicted_label == 1:
+          TN += 1  # True Negative
+      elif true_label == 1 and predicted_label == 0:
+          FP += 1  # False Positive
+      elif true_label == 0 and predicted_label == 1:
+          FN += 1  # False Negative
     
-    print("======================================\nTrained SAE 1\n======================================")
-    
-    encoded_features_from_sae1 = []
-    labels_from_sae1 = []
+    avg_TP.append(TP)
+    avg_FP.append(FP)
+    avg_FN.append(FN)
+    avg_TN.append(TN)
 
-    for batch in train_dataloader:
-      data, labels = batch
-      data = data.float().to(device) 
+    accuracy = (TP + TN) / (TP + TN + FP + FN)
+    sensitivity = TP / (TP + FN) 
+    recall = TN / (TN + FP) 
+    precision = TP / (TP + FP)
+    f1 = (2 * precision * sensitivity) / (precision + sensitivity)
+    cm = np.array([[TP,FP],[FN,TN]])
 
-      with torch.no_grad():
-        encoded_features, _, __ = SAE1(data)
-        encoded_features_from_sae1.append(encoded_features)
-        labels_from_sae1.append(labels)
-
-    encoded_dataset_tensor = torch.cat(encoded_features_from_sae1, dim=0)
-    labels_tensor = torch.cat(labels_from_sae1, dim=0)
-
-    encoded_dataset = TensorDataset(encoded_dataset_tensor, labels_tensor) 
-
-    encoded_dataset_loader = DataLoader(encoded_dataset, **params)
-
-    loss_sae2 = []
-    # Train SAE 2
-    for epoch in range(SAE2_epochs):
-      for batch in encoded_dataset_loader:
-        data, labels = batch
-        data = data.float().to(device) 
-
-        optimizer_sae2.zero_grad()
-
-        encoded_features, decoded_featues, loss = SAE2(data)
-
-        loss.backward()
-        optimizer_sae2.step()
-      loss_sae2.append(loss.item())
-      print(f"SAE 2: Epoch {epoch}, loss {loss.item()}")
-
-    print("======================================\nTrained SAE 2\n======================================")
-    
-    encoded_features_from_sae2 = []
-    labels_from_sae2 = []
-    for batch in encoded_dataset_loader:
-      data, labels = batch
-      data = data.float().to(device) 
-
-      with torch.no_grad():
-        encoded_features, _, __ = SAE2(data)
-        encoded_features_from_sae2.append(encoded_features)
-        labels_from_sae2.append(labels)
-
-    encoded_dataset_tensor = torch.cat(encoded_features_from_sae2, dim=0)
-    labels_tensor = torch.cat(labels_from_sae2, dim=0)
-
-    encoded_dataset = TensorDataset(encoded_dataset_tensor, labels_tensor) 
-
-    encoded_dataset_loader = DataLoader(encoded_dataset, **params)
-
-    loss_classifier = []
-    # Train classifier
-    for epoch in range(classifier_epochs):
-      for batch in encoded_dataset_loader:
-        data, labels = batch
-        data = data.float().to(device) 
-        labels = labels.long().to(device) 
-
-        optimizer_classifier.zero_grad()
-
-        classifier_output = classifier(data)
-
-        loss = classifier_criterion(classifier_output, labels)
-        loss.backward()
-        optimizer_classifier.step()
-      loss_classifier.append(loss.item())
-      print(f"Classifier: Epoch {epoch} loss: {loss.item()}")
-
-    print("======================================\nTrained classifier\n======================================")
-
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-
-    loss_model = []
-    for epoch in range(fine_tuning_epochs):
-      for batch in train_dataloader:
-        data, labels = batch
-        data = data.float().to(device)
-        labels = labels.long().to(device) 
-
-        optimizer.zero_grad()
-        outputs = model(data)
-        loss = classifier_criterion(outputs, labels) 
-        loss.backward()
-        optimizer.step()
-      loss_model.append(loss.item())
-      print(f"Model: Epoch {epoch} loss: {loss.item()}")
-
-    print("======================================\nFine tuned model\n======================================")
-
-    dig, axs = plt.subplots(1, 4, figsize=(15,5))
-    
-    axs[0].plot(range(SAE1_epochs), loss_sae1)
-    axs[0].set_title('SAE1 Loss')
-    axs[0].set_xlabel('Epoch')
-    axs[0].set_ylabel('Loss')
-
-    # Plot for SAE2
-    axs[1].plot(range(SAE2_epochs), loss_sae2)
-    axs[1].set_title('SAE2 Loss')
-    axs[1].set_xlabel('Epoch')
-    # axs[1].set_ylabel('Loss')  # Optional, as it shares the y-axis with the first plot
-
-    # Plot for Classifier
-    axs[2].plot(range(classifier_epochs), loss_classifier)
-    axs[2].set_title('Classifier Loss')
-    axs[2].set_xlabel('Epoch')
-    # axs[2].set_ylabel('Loss')  # Optional, as it shares the y-axis with the first plot
-
-    axs[3].plot(range(fine_tuning_epochs), loss_model)
-    axs[3].set_title('Model Loss')
-    axs[3].set_xlabel('Epoch')
-
-    plt.tight_layout()  # Adjust the padding between and around subplots
-    plt.show()
-
-    pdb.set_trace()
-
-    torch.save(SAE1.state_dict(), 'SAE1.pth')
-    torch.save(SAE2.state_dict(), 'SAE2.pth')
-    torch.save(classifier.state_dict(), 'classifier.pth')
-  else:
-    SAE1.load_state_dict(torch.load('SAE1.pth'))
-    SAE2.load_state_dict(torch.load('SAE2.pth'))
-    classifier.load_state_dict(torch.load('classifier.pth'))
-
-  print("Infer data from trained SAE")
-  encoded_test_data, test_labels = encode_data(test_dataloader, SAE1, SAE2, device)
-
-  classifier.eval()
-
-  total = 0
-  correct = 0
-
-  true_labels = np.array([])
-  predicted_labels = np.array([])
-
-  for i in range(len(encoded_test_data)):
-    data = encoded_test_data[i].float().to(device) 
-    labels = test_labels[i].long().to(device) 
-
-    outputs = classifier(data)
-
-    _, predicted = torch.max(outputs.data, 1)
-
-    true_labels = np.concatenate((true_labels,labels.cpu().numpy()),axis=0)
-    predicted_labels = np.concatenate((predicted_labels,predicted.cpu().numpy()),axis=0)
-
-  TP,FP,TN,FN = 0,0,0,0
-
-  for true_label, predicted_label in zip(true_labels, predicted_labels):
-    if true_label == predicted_label == 0:
-        TP += 1  # True Positive
-    elif true_label == predicted_label == 1:
-        TN += 1  # True Negative
-    elif true_label == 1 and predicted_label == 0:
-        FP += 1  # False Positive
-    elif true_label == 0 and predicted_label == 1:
-        FN += 1  # False Negative
+    print(f'Accuracy: {(accuracy * 100):.2f}%')
+    print(f'Recall: {recall:.2f}')
+    print(f'Precision: {precision:.2f}')
+    print(f'F1_Score: {f1:.2f}')
+    print(f'Confusion Matrix:\n{cm}')
+  
+  print("======================================\nCompleted splits\n======================================")
+  TP = sum(avg_TP)/len(avg_TP)
+  FP = sum(avg_FP)/len(avg_FP)
+  FN = sum(avg_FN)/len(avg_FN)
+  TN = sum(avg_TN)/len(avg_TN)
 
   accuracy = (TP + TN) / (TP + TN + FP + FN)
   sensitivity = TP / (TP + FN) 
