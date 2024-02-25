@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 
 def get_data_from_abide():
   downloads = 'abide/downloads/Outputs/ccs/filt_global/rois_aal/'
-  pheno_file = 'abide/Phenotypic_V1_0b_preprocessed1.csv'
+  pheno_file = 'data/Phenotypic_V1_0b_preprocessed1.csv'
 
   pheno_file = open(pheno_file, 'r')
   pheno_list = pheno_file.readlines()
