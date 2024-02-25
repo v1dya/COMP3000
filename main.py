@@ -295,7 +295,7 @@ if __name__ == "__main__":
     model = StackedSparseAutoencoder(SAE1, SAE2, classifier).to(device)
 
     verbose = True
-    train_model = True
+    train_model = False
     if (train_model):
       SAE1_epochs = 50
       optimizer_sae1 = optim.Adam( SAE1.parameters(), lr=0.001, weight_decay=1e-4 )
